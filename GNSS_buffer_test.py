@@ -117,7 +117,7 @@ try:
                 continue
 
             # 2) Positions-Daten aus GGA
-            if "$GGA" in line:
+            if line.startswith("$GPGGA") or line.startswith("$GNGGA"):
                 print("➡️ GGA-Zeile erkannt!")
                 data = parse_gpgga(line)
                 if data:
