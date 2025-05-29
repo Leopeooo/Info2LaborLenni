@@ -107,7 +107,7 @@ def flush_buffer_to_db(cursor, db):
 # Hauptprogramm
 # -------------------------
 if __name__ == "__main__":
-    last_speed = None
+    last_speed = None  # falls kein RMC ankam, später optional 0.0 setzen
 
     try:
         # GNSS-Sensor öffnen
@@ -139,27 +139,29 @@ if __name__ == "__main__":
                     continue
                 print(f"Empfangen: {line}")
 
-                # Header (Talker+Sentence) extrahieren
+                # DEBUG: zeigen, was für ein Header ankommt
                 header = line.split(",")[0]
+                print(f"[DEBUG] Header = {header}")
 
-                # 1) Geschwindigkeit aus RMC
-                if header.endswith("RMC"):
+                # 1) Geschwindigkeit aus RMC-Zeile holen
+                if header in ("$GPRMC", "$GNRMC"):
                     speed = parse_gprmc(line)
                     if speed is not None:
                         last_speed = speed
                         print(f"🚀 Speed aktualisiert: {last_speed:.2f} km/h")
                     continue
 
-                # 2) Positionsdaten aus GGA
+                # 2) Positionsdaten aus GGA-Zeile holen
                 if header.endswith("GGA"):
                     print("➡️ GGA-Zeile erkannt!")
                     data = parse_gpgga(line)
                     if data:
                         lat, lon, alt = data
                         timestamp = datetime.utcnow()
-                        speed = last_speed
+                        # fallback, falls never gesetzt:
+                        speed = last_speed if last_speed is not None else 0.0
 
-                        print(f"🌍 Parsed: {lat}, {lon}, {alt} m  🚀 {speed} km/h")
+                        print(f"🌍 Parsed: {lat}, {lon}, {alt} m  🚀 {speed:.2f} km/h")
                         try:
                             cursor.execute(
                                 """
