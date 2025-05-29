@@ -41,6 +41,22 @@ for var in ("DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD"):
 # -------------------------
 # Hilfsfunktionen
 # -------------------------
+def connect_db():
+    """(Re)connect to the database and flush any buffered rows."""
+    global db, cursor
+    try:
+        if db:
+            db.close()
+    except:
+        pass
+    db = psycopg2.connect(
+        host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
+        user=DB_USER, password=DB_PASSWORD, sslmode="require"
+    )
+    cursor = db.cursor()
+    print("🔄 (Re)connected to DB")
+    flush_buffer_to_db()
+
 def convert_to_decimal(raw: str, direction: str):
     if not raw or not direction:
         return None
@@ -68,77 +84,56 @@ def parse_gprmc(line: str):
     if len(parts) < 8 or not parts[7]:
         return None
     speed_kn = float(parts[7])
-    return speed_kn * 1.852  # Knoten → km/h
+    return speed_kn * 1.852  # kn → km/h
 
-def save_to_buffer(timestamp, lat, lon, alt, speed):
-    # Atomar: erst in Temp, dann ersetzen
-    fd, tmp_path = tempfile.mkstemp(dir=".", prefix=BUFFER_FILE, text=True)
+def save_to_buffer(ts, lat, lon, alt, speed):
+    """Atomically prepend a row to BUFFER_FILE."""
+    fd, tmp = tempfile.mkstemp(dir=".", prefix=BUFFER_FILE, text=True)
     with os.fdopen(fd, "w", newline="") as f_tmp:
         writer = csv.writer(f_tmp)
-        # neue Zeile an den Anfang
-        writer.writerow([timestamp.isoformat(), lat, lon, alt, speed])
-        # vorhandene Zeilen anhängen
+        writer.writerow([ts.isoformat(), lat, lon, alt, speed])
         if os.path.exists(BUFFER_FILE):
             with open(BUFFER_FILE, "r", newline="") as f_old:
                 for row in f_old:
                     f_tmp.write(row)
-    os.replace(tmp_path, BUFFER_FILE)
+    os.replace(tmp, BUFFER_FILE)
     print("💾 Gespeichert im Puffer (Offline-Modus)")
 
-def flush_buffer_to_db(cursor, db):
+def flush_buffer_to_db():
+    """Try to insert all buffered rows; keep only failures."""
     if not os.path.exists(BUFFER_FILE):
         return
     rows = list(csv.reader(open(BUFFER_FILE, "r", newline="")))
     if not rows:
         return
 
-    success_count = 0
-    remaining = []
+    success = 0
+    failed = []
 
     for row in rows:
         try:
             cursor.execute(
-                """
-                INSERT INTO gnss_data
-                  (timestamp, latitude, longitude, altitude, speed)
-                VALUES (%s, %s, %s, %s, %s)
-                """,
-                (
-                    row[0],                # ISO-String
-                    float(row[1]),
-                    float(row[2]),
-                    float(row[3]),
-                    float(row[4]),
-                )
+                "INSERT INTO gnss_data (timestamp, latitude, longitude, altitude, speed) "
+                "VALUES (%s,%s,%s,%s,%s)",
+                (row[0], float(row[1]), float(row[2]), float(row[3]), float(row[4]))
             )
         except Exception as e:
-            print(f"❌ Nachtrag-Fehler bei {row}: {e} – überspringe")
-            remaining.append(row)
+            print(f"❌ Nachtrag-Fehler bei {row}: {e}")
+            failed.append(row)
         else:
-            success_count += 1
+            success += 1
 
-    if success_count > 0:
-        db.commit()
-        # Puffer nur mit nicht erfolgreichen Zeilen neu schreiben
+    if success > 0:
+        try:
+            db.commit()
+        except Exception as e:
+            print(f"⚠️ Commit-Fehler: {e} – Reconnecting for next attempt")
+            connect_db()
+            return
+
         with open(BUFFER_FILE, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerows(remaining)
-        print(f"✅ {success_count} gepufferte Datensätze nachgetragen; {len(remaining)} verbleiben.")
-
-def connect_db():
-    global db, cursor
-    try:
-        if db:
-            db.close()
-    except:
-        pass
-    db = psycopg2.connect(
-        host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
-        user=DB_USER, password=DB_PASSWORD, sslmode="require"
-    )
-    cursor = db.cursor()
-    print("🔄 (Re)connected to DB")
-    flush_buffer_to_db(cursor, db)
+            csv.writer(f).writerows(failed)
+        print(f"✅ {success} gepufferte Datensätze nachgetragen; {len(failed)} verbleiben.")
 
 # -------------------------
 # Hauptprogramm
@@ -148,12 +143,10 @@ if __name__ == "__main__":
     last_flush = time.time()
 
     try:
-        # Sensor & DB öffnen
         ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
         print("✅ GNSS-Sensor verbunden!")
         connect_db()
 
-        # Daten einlesen
         while True:
             line = ser.readline().decode("utf-8", errors="ignore").strip()
             if not line:
@@ -163,7 +156,7 @@ if __name__ == "__main__":
             header = line.split(",")[0]
             print(f"[DEBUG] Header = {header}")
 
-            # Geschwindigkeit
+            # Speed aus RMC
             if header in ("$GPRMC", "$GNRMC"):
                 speed = parse_gprmc(line)
                 if speed is not None:
@@ -171,7 +164,7 @@ if __name__ == "__main__":
                     print(f"🚀 Speed aktualisiert: {last_speed:.2f} km/h")
                 continue
 
-            # Position
+            # Position aus GGA
             if header.endswith("GGA"):
                 print("➡️ GGA-Zeile erkannt!")
                 data = parse_gpgga(line)
@@ -183,32 +176,34 @@ if __name__ == "__main__":
                 speed = last_speed if last_speed is not None else 0.0
                 print(f"🌍 Parsed: {lat}, {lon}, {alt} m  🚀 {speed:.2f} km/h")
 
+                # Live-Insert mit reconnect-Check
                 try:
-                    # sicherstellen, dass DB verbunden ist
                     if cursor is None or cursor.closed or db.closed:
                         connect_db()
                     cursor.execute(
-                        """
-                        INSERT INTO gnss_data
-                          (timestamp, latitude, longitude, altitude, speed)
-                        VALUES (%s, %s, %s, %s, %s)
-                        """,
+                        "INSERT INTO gnss_data (timestamp, latitude, longitude, altitude, speed) "
+                        "VALUES (%s,%s,%s,%s,%s)",
                         (ts.isoformat(), lat, lon, alt, speed)
                     )
                     db.commit()
                     print(f"✅ Gespeichert in DB: {ts.isoformat()}")
-                    flush_buffer_to_db(cursor, db)
-
-                except Exception as db_err:
-                    print(f"❌ Insert-Fehler: {db_err}")
+                    flush_buffer_to_db()
+                except Exception as e:
+                    print(f"❌ Insert-Fehler: {e}")
                     save_to_buffer(ts, lat, lon, alt, speed)
-                    # DB neu verbinden für nächsten Versuch
                     connect_db()
 
-            # Periodischer Flush
+            # Periodischer reconnect + flush alle 30 Sekunden
             if time.time() - last_flush >= 30:
-                if cursor and not cursor.closed:
-                    flush_buffer_to_db(cursor, db)
+                try:
+                    if cursor is None or cursor.closed or db.closed:
+                        connect_db()
+                    else:
+                        cursor.execute("SELECT 1")
+                    flush_buffer_to_db()
+                except Exception as e:
+                    print(f"⚠️ Periodischer Flush/Reconnect-Fehler: {e}")
+                    connect_db()
                 last_flush = time.time()
 
     except KeyboardInterrupt:
@@ -219,9 +214,9 @@ if __name__ == "__main__":
 
     finally:
         print("\n📦 Aufräumen…")
-        if ser is not None:
+        if ser:
             ser.close()
-        if cursor is not None:
+        if cursor:
             cursor.close()
-        if db is not None:
+        if db:
             db.close()
