@@ -8,7 +8,7 @@ from pathlib import Path
 from datetime import datetime
 import psycopg2
 
-# ---------------------------------------------------
+# -------------------------
 # Variablen vorab anlegen
 # -------------------------
 ser = None
@@ -33,7 +33,7 @@ DB_NAME     = os.getenv("DB_NAME")
 DB_USER     = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 
-# Pflicht-ENV prüfen
+# Pflicht-Variablen prüfen
 for var in ("DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD"):
     if not globals()[var]:
         raise RuntimeError(f"Environment variable {var} is not set in .env")
@@ -61,16 +61,14 @@ def parse_gpgga(line: str):
         alt = float(parts[9])
     except ValueError:
         alt = None
-    return (lat, lon, alt)
+    return lat, lon, alt
 
 def parse_gprmc(line: str):
     parts = line.split(",")
-    # [7] = speed over ground in knots
-    if len(parts) < 8 or parts[7] == "":
+    if len(parts) < 8 or not parts[7]:
         return None
     speed_kn = float(parts[7])
-    # convert knots → km/h
-    return speed_kn * 1.852
+    return speed_kn * 1.852  # Knoten → km/h
 
 def save_to_buffer(timestamp, lat, lon, alt, speed):
     with open(BUFFER_FILE, "a", newline="") as f:
@@ -129,10 +127,10 @@ if __name__ == "__main__":
         cursor = db.cursor()
         print("✅ Mit Datenbank verbunden!")
 
-        # Vorhandenen Puffer nachtragen
+        # Puffer nachtragen falls vorhanden
         flush_buffer_to_db(cursor, db)
 
-        # Endlosschleife zum Einlesen
+        # Endlosschleife: NMEA-Daten lesen
         while True:
             try:
                 raw = ser.readline()
@@ -141,7 +139,7 @@ if __name__ == "__main__":
                     continue
                 print(f"Empfangen: {line}")
 
-                # NMEA-Header extrahieren
+                # Header (Talker+Sentence) extrahieren
                 header = line.split(",")[0]
 
                 # 1) Geschwindigkeit aus RMC
@@ -159,10 +157,9 @@ if __name__ == "__main__":
                     if data:
                         lat, lon, alt = data
                         timestamp = datetime.utcnow()
-                        speed = last_speed  # kann None sein, wenn kein RMC dazwischen
+                        speed = last_speed
 
                         print(f"🌍 Parsed: {lat}, {lon}, {alt} m  🚀 {speed} km/h")
-
                         try:
                             cursor.execute(
                                 """
@@ -174,8 +171,6 @@ if __name__ == "__main__":
                             )
                             db.commit()
                             print(f"✅ Gespeichert in DB: {timestamp}")
-
-                            # Puffer leeren, falls vorhanden
                             flush_buffer_to_db(cursor, db)
 
                         except Exception as db_err:
