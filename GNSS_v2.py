@@ -3,7 +3,7 @@ import os, time, serial, csv, tempfile, psycopg2, logging
 from dotenv import load_dotenv
 from pathlib import Path
 
-from datetime import datetime
+from datetime import datetime, date, time as dtime
 
 # ---------------------------------------------------
 # Online‑Check (leichter UDP‑Ping)
@@ -169,25 +169,33 @@ def flush_buffer_to_db():
 # ---------------------------------------------------
 # Hauptprogramm
 # ---------------------------------------------------
-if __name__=="__main__":
+if __name__ == "__main__":
     ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
     log.info("✅ GNSS-Sensor verbunden!")
     connect_db()
 
     last_speed, last_flush = None, time.time()
+    last_date = None  # für echtes Datum aus RMC
 
     try:
         while True:
-            line = ser.readline().decode('utf-8','ignore').strip()
+            line = ser.readline().decode('utf-8', 'ignore').strip()
             if not line: continue
             hdr = line.split(',')[0]
 
-            # Geschwindigkeit
-            if hdr in ("$GPRMC","$GNRMC"):
-                sp = parse_gprmc(line)
-                if sp is not None:
-                    last_speed = sp
-                    log.info("🚀 Speed %.2f km/h", sp)
+            # Geschwindigkeit & Datum
+            if hdr in ("$GPRMC", "$GNRMC"):
+                p = line.split(',')
+                if len(p) > 7 and p[7]:
+                    try:
+                        last_speed = float(p[7]) * 1.852
+                        log.info("🚀 Speed %.2f km/h", last_speed)
+                    except: pass
+                if len(p) > 9 and p[9]:
+                    try:
+                        last_date = datetime.strptime(p[9], "%d%m%y").date()
+                    except:
+                        log.warning("⚠️  Datum konnte nicht gelesen werden: %s", p[9])
                 continue
 
             # Position
@@ -195,7 +203,16 @@ if __name__=="__main__":
                 data = parse_gpgga(line)
                 if not data: continue
                 lat, lon, alt = data
-                ts  = datetime.utcnow()
+                nmea_time = line.split(',')[1]
+                try:
+                    h = int(nmea_time[0:2])
+                    m = int(nmea_time[2:4])
+                    s = int(nmea_time[4:6])
+                    ts_date = last_date or date.today()
+                    ts = datetime.combine(ts_date, dtime(h, m, s))
+                except:
+                    ts = datetime.utcnow()
+
                 spd = last_speed or 0.0
                 try:
                     if not cursor or cursor.closed or db.closed:
@@ -215,7 +232,7 @@ if __name__=="__main__":
                     connect_db()
 
             # periodischer Flush
-            if time.time()-last_flush >= 30:
+            if time.time() - last_flush >= 30:
                 try:
                     cursor.execute("SELECT 1")
                     flush_buffer_to_db()
@@ -224,7 +241,7 @@ if __name__=="__main__":
                 last_flush = time.time()
 
     except KeyboardInterrupt:
-        log.info("❌ Logger beendet per Tastatur")
+        log.info("Logger beendet per Tastatur  ❌")
     finally:
         if ser:    ser.close()
         if cursor: cursor.close()
